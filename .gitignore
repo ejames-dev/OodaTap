@@ -1,0 +1,25 @@
+# Python & virtualenvs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Test & linter caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local artifacts & IDE/notes
+.obsidian/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.env
+.env.*
+out/
+reports/

@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oodatap"
+version = "0.1.0"
+description = "Passive network detection for autonomous and hybrid human+agentic OODA loops without decrypting TLS."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+  { name = "Evan Newman" },
+]
+keywords = [
+  "cybersecurity",
+  "ndr",
+  "network-security",
+  "ai-security",
+  "agentic-threats",
+  "encrypted-traffic-analysis",
+  "zeek",
+  "pcap",
+  "threat-hunting",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: System :: Networking :: Monitoring",
+]
+dependencies = [
+  "jinja2>=3.1.4",
+  "numpy>=2.0.0",
+  "pydantic>=2.9.0",
+  "pyyaml>=6.0.1",
+  "rich>=13.9.0",
+  "typer>=0.15.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+  "ruff>=0.11.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ejames-dev/OodaTap"
+Repository = "https://github.com/ejames-dev/OodaTap"
+Issues = "https://github.com/ejames-dev/OodaTap/issues"
+
+[project.scripts]
+oodatap = "oodatap.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oodatap"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

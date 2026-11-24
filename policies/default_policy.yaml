@@ -1,0 +1,75 @@
+# OodaTap default detection and allowlisting policy
+
+internal_cidrs:
+  - "10.0.0.0/8"
+  - "172.16.0.0/12"
+  - "192.168.0.0/16"
+
+# Known LLM inference API domains (matched via TLS ClientHello SNI or Zeek/Suricata SSL logs).
+# OodaTap can still score unknown HTTPS endpoints structurally when sawtooth + SSE patterns emerge.
+llm_domains:
+  - "api.openai.com"
+  - "api.anthropic.com"
+  - "generativelanguage.googleapis.com"
+  - "openrouter.ai"
+  - "api.groq.com"
+  - "api.together.xyz"
+  - "api.mistral.ai"
+  - "api.deepseek.com"
+  - "bedrock-runtime."
+  - "openai.azure.com"
+
+# Self-hosted inference ports (Ollama, vLLM, TGI, LiteLLM)
+llm_ports:
+  - 11434
+  - 8000
+  - 8080
+  - 4000
+
+# High-value lateral movement / internal recon ports
+sensitive_lateral_ports:
+  - 22     # SSH
+  - 88     # Kerberos
+  - 135    # MSRPC
+  - 139    # NetBIOS
+  - 389    # LDAP
+  - 445    # SMB
+  - 636    # LDAPS
+  - 1433   # MSSQL
+  - 2375   # Docker API
+  - 3306   # MySQL
+  - 3389   # RDP
+  - 5432   # PostgreSQL
+  - 5985   # WinRM HTTP
+  - 5986   # WinRM HTTPS
+  - 6443   # Kubernetes API
+  - 8200   # HashiCorp Vault
+  - 9200   # Elasticsearch
+
+# Benign developer / coding-agent allowlist (prevents false positives on Cursor, Claude Code, etc.)
+dev_allowlist:
+  cidrs:
+    - "127.0.0.0/8"
+  hosts:
+    - "10.0.10.50"   # Example internal git / artifact mirror
+  ports:
+    - 3000
+    - 5173
+    - 8081
+    - 9418
+  # Hosts permitted to run approved coding agents against dev_allowlist destinations only
+  approved_dev_hosts: []
+
+# Scoring thresholds and composite weights
+scoring:
+  weights:
+    sawtooth: 0.30
+    coupler: 0.45
+    kinematics: 0.25
+  alert_threshold: 0.58
+  suspicious_threshold: 0.40
+  min_turns_for_sawtooth: 4
+  min_actions_for_coupling: 4
+  max_obs_lag_seconds: 2.5
+  max_dispatch_lag_seconds: 2.2
+  fanout_window_seconds: 0.20
