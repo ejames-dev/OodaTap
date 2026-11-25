@@ -5,6 +5,7 @@ from oodatap.benchmark.generator import (
     SCENARIO_CLASSES,
     GeneratedScenario,
     generate_corpus,
+    generate_mixed_enterprise_events,
     generate_scenario,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "SCENARIO_CLASSES",
     "ScenarioEvaluation",
     "generate_corpus",
+    "generate_mixed_enterprise_events",
     "generate_scenario",
     "run_benchmark",
 ]

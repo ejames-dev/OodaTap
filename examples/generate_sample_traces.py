@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from oodatap.benchmark.generator import generate_scenario
+from oodatap.benchmark.generator import generate_mixed_enterprise_events, generate_scenario
 from oodatap.ingest.jsonl import write_jsonl
-from oodatap.ingest.pcap import write_pcap_from_events
+from oodatap.ingest.pcap import write_pcap_from_events, write_pcapng_from_events
 from oodatap.schemas import ActionEvent, TlsBurstEvent
 
 SAMPLE_DIR = Path(__file__).resolve().parent / "sample_traces"
@@ -64,6 +64,9 @@ def main() -> None:
 
     autonomous = generate_scenario("autonomous_agent_intrusion", seed=2028)
     _write_zeek_json_sample(autonomous.events, SAMPLE_DIR / "zeek_sample_conn.log")
+
+    mixed_events, _expected = generate_mixed_enterprise_events(seed=2029)
+    write_pcapng_from_events(mixed_events, SAMPLE_DIR / "mixed_enterprise.pcapng")
 
     print(f"Wrote sample traces into {SAMPLE_DIR}")
 

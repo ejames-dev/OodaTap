@@ -1,4 +1,4 @@
-"""Pure-Python binary .pcap reader/writer with TLS ClientHello SNI and AppData burst framing."""
+"""Pure-Python binary .pcap/.pcapng reader & writer (IPv4/IPv6 + TLS SNI & AppData bursts)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import ipaddress
 import socket
 import struct
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,13 +18,26 @@ PCAP_MAGIC_USEC_BE = 0xD4C3B2A1
 PCAP_MAGIC_NSEC_LE = 0xA1B23C4D
 PCAP_MAGIC_NSEC_BE = 0x4D3CB2A1
 
+PCAPNG_SHB_TYPE = 0x0A0D0D0A
+PCAPNG_IDB_TYPE = 0x00000001
+PCAPNG_SPB_TYPE = 0x00000003
+PCAPNG_EPB_TYPE = 0x00000006
+PCAPNG_BYTE_ORDER_MAGIC_LE = 0x1A2B3C4D
+PCAPNG_BYTE_ORDER_MAGIC_BE = 0x4D3C2B1A
+
 DLT_EN10MB = 1
 DLT_RAW = 101
 DLT_LINUX_SLL = 113
 
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_VLAN = 0x8100
+ETHERTYPE_IPV6 = 0x86DD
+
 TLS_HANDSHAKE = 0x16
 TLS_APP_DATA = 0x17
 TLS_CLIENT_HELLO = 0x01
+
+_IPV6_EXT_HEADERS = {0, 43, 44, 60}
 
 
 @dataclass
@@ -147,45 +160,20 @@ def inspect_tls_app_data(payload: bytes) -> tuple[int, int]:
     return records, total_bytes
 
 
-def _parse_frame(frame: bytes, link_type: int, ts: float) -> _PacketRecord | None:
-    if link_type == DLT_EN10MB:
-        if len(frame) < 14:
-            return None
-        ethertype = struct.unpack("!H", frame[12:14])[0]
-        offset = 14
-        if ethertype == 0x8100 and len(frame) >= 18:
-            ethertype = struct.unpack("!H", frame[16:18])[0]
-            offset = 18
-        if ethertype != 0x0800:
-            return None
-    elif link_type == DLT_LINUX_SLL:
-        if len(frame) < 16:
-            return None
-        ethertype = struct.unpack("!H", frame[14:16])[0]
-        if ethertype != 0x0800:
-            return None
-        offset = 16
-    elif link_type == DLT_RAW:
-        offset = 0
-    else:
-        return None
-
-    if len(frame) < offset + 20:
-        return None
-    ver_ihl = frame[offset]
-    if (ver_ihl >> 4) != 4:
-        return None
-    ihl = (ver_ihl & 0x0F) * 4
-    total_len = struct.unpack("!H", frame[offset + 2 : offset + 4])[0]
-    proto = frame[offset + 9]
-    src_ip = socket.inet_ntoa(frame[offset + 12 : offset + 16])
-    dst_ip = socket.inet_ntoa(frame[offset + 16 : offset + 20])
-    l4_start = offset + ihl
-    l4_end = min(len(frame), offset + total_len)
-
+def _parse_l4(
+    frame: bytes,
+    l4_start: int,
+    l4_end: int,
+    proto: int,
+    src_ip: str,
+    dst_ip: str,
+    ts: float,
+) -> _PacketRecord | None:
     if proto == 6 and l4_end >= l4_start + 20:  # TCP
         src_port, dst_port = struct.unpack("!HH", frame[l4_start : l4_start + 4])
         data_offset = (frame[l4_start + 12] >> 4) * 4
+        if data_offset < 20 or l4_start + data_offset > l4_end:
+            return None
         tcp_flags = frame[l4_start + 13]
         payload = frame[l4_start + data_offset : l4_end]
         return _PacketRecord(ts, src_ip, dst_ip, src_port, dst_port, 6, tcp_flags, payload)
@@ -196,6 +184,197 @@ def _parse_frame(frame: bytes, link_type: int, ts: float) -> _PacketRecord | Non
         return _PacketRecord(ts, src_ip, dst_ip, src_port, dst_port, 17, 0, payload)
 
     return None
+
+
+def _parse_ipv4(frame: bytes, offset: int, ts: float) -> _PacketRecord | None:
+    if len(frame) < offset + 20:
+        return None
+    ver_ihl = frame[offset]
+    if (ver_ihl >> 4) != 4:
+        return None
+    ihl = (ver_ihl & 0x0F) * 4
+    if ihl < 20 or len(frame) < offset + ihl:
+        return None
+    total_len = struct.unpack("!H", frame[offset + 2 : offset + 4])[0]
+    proto = frame[offset + 9]
+    src_ip = socket.inet_ntop(socket.AF_INET, frame[offset + 12 : offset + 16])
+    dst_ip = socket.inet_ntop(socket.AF_INET, frame[offset + 16 : offset + 20])
+    l4_start = offset + ihl
+    l4_end = min(len(frame), offset + total_len) if total_len >= ihl else len(frame)
+    return _parse_l4(frame, l4_start, l4_end, proto, src_ip, dst_ip, ts)
+
+
+def _parse_ipv6(frame: bytes, offset: int, ts: float) -> _PacketRecord | None:
+    if len(frame) < offset + 40:
+        return None
+    if (frame[offset] >> 4) != 6:
+        return None
+    payload_len = struct.unpack("!H", frame[offset + 4 : offset + 6])[0]
+    next_hdr = frame[offset + 6]
+    src_ip = socket.inet_ntop(socket.AF_INET6, frame[offset + 8 : offset + 24])
+    dst_ip = socket.inet_ntop(socket.AF_INET6, frame[offset + 24 : offset + 40])
+
+    pos = offset + 40
+    l4_end = min(len(frame), pos + payload_len) if payload_len > 0 else len(frame)
+
+    # Walk IPv6 extension headers (Hop-by-Hop, Routing, Fragment, Destination Options).
+    while next_hdr in _IPV6_EXT_HEADERS:
+        if next_hdr == 44:  # Fragment header is fixed 8 bytes
+            if pos + 8 > l4_end:
+                return None
+            next_hdr = frame[pos]
+            pos += 8
+        else:
+            if pos + 2 > l4_end:
+                return None
+            next_hdr = frame[pos]
+            hdr_ext_len = (frame[pos + 1] + 1) * 8
+            if pos + hdr_ext_len > l4_end:
+                return None
+            pos += hdr_ext_len
+
+    return _parse_l4(frame, pos, l4_end, next_hdr, src_ip, dst_ip, ts)
+
+
+def _parse_frame(frame: bytes, link_type: int, ts: float) -> _PacketRecord | None:
+    if link_type == DLT_EN10MB:
+        if len(frame) < 14:
+            return None
+        ethertype = struct.unpack("!H", frame[12:14])[0]
+        offset = 14
+        if ethertype == ETHERTYPE_VLAN and len(frame) >= 18:
+            ethertype = struct.unpack("!H", frame[16:18])[0]
+            offset = 18
+        if ethertype == ETHERTYPE_IPV4:
+            return _parse_ipv4(frame, offset, ts)
+        if ethertype == ETHERTYPE_IPV6:
+            return _parse_ipv6(frame, offset, ts)
+        return None
+
+    if link_type == DLT_LINUX_SLL:
+        if len(frame) < 16:
+            return None
+        ethertype = struct.unpack("!H", frame[14:16])[0]
+        if ethertype == ETHERTYPE_IPV4:
+            return _parse_ipv4(frame, 16, ts)
+        if ethertype == ETHERTYPE_IPV6:
+            return _parse_ipv6(frame, 16, ts)
+        return None
+
+    if link_type == DLT_RAW:
+        if not frame:
+            return None
+        ip_ver = frame[0] >> 4
+        if ip_ver == 4:
+            return _parse_ipv4(frame, 0, ts)
+        if ip_ver == 6:
+            return _parse_ipv6(frame, 0, ts)
+        return None
+
+    return None
+
+
+def _iter_classic_pcap_frames(data: bytes) -> Iterator[tuple[float, int, bytes]]:
+    if len(data) < 24:
+        raise ValueError("Capture file is too small to be a valid .pcap file.")
+    magic = struct.unpack("<I", data[:4])[0]
+    if magic == PCAP_MAGIC_USEC_LE:
+        endian, ts_div = "<", 1_000_000.0
+    elif magic == PCAP_MAGIC_USEC_BE:
+        endian, ts_div = ">", 1_000_000.0
+    elif magic == PCAP_MAGIC_NSEC_LE:
+        endian, ts_div = "<", 1_000_000_000.0
+    elif magic == PCAP_MAGIC_NSEC_BE:
+        endian, ts_div = ">", 1_000_000_000.0
+    else:
+        raise ValueError(f"Unsupported pcap magic header: 0x{magic:08x}")
+
+    _vmaj, _vmin, _tz, _sig, _snaplen, link_type = struct.unpack(f"{endian}HHiIII", data[4:24])
+    pos = 24
+    while pos + 16 <= len(data):
+        ts_sec, ts_sub, incl_len, _orig_len = struct.unpack(f"{endian}IIII", data[pos : pos + 16])
+        pos += 16
+        if pos + incl_len > len(data):
+            break
+        frame = data[pos : pos + incl_len]
+        pos += incl_len
+        yield ts_sec + (ts_sub / ts_div), link_type, frame
+
+
+def _parse_pcapng_idb_options(options_bytes: bytes, endian: str) -> tuple[float, float]:
+    """Parse if_tsresol (opt 9) and if_tsoffset (opt 14) from a PCAPNG Interface Description."""
+    ts_unit = 1e-6  # Default per PCAPNG spec: 10^-6 seconds (microseconds)
+    ts_offset = 0.0
+    pos = 0
+    n = len(options_bytes)
+    while pos + 4 <= n:
+        opt_code, opt_len = struct.unpack(f"{endian}HH", options_bytes[pos : pos + 4])
+        pos += 4
+        if opt_code == 0:  # opt_endofopt
+            break
+        if pos + opt_len > n:
+            break
+        val = options_bytes[pos : pos + opt_len]
+        if opt_code == 9 and opt_len >= 1:
+            raw_res = val[0]
+            ts_unit = 2.0 ** -(raw_res & 0x7F) if raw_res & 0x80 else 10.0 ** -(raw_res & 0x7F)
+        elif opt_code == 14 and opt_len >= 8:
+            ts_offset = float(struct.unpack(f"{endian}q", val[:8])[0])
+        pos += (opt_len + 3) & ~3
+    return ts_unit, ts_offset
+
+
+def _iter_pcapng_frames(data: bytes) -> Iterator[tuple[float, int, bytes]]:
+    """Iterate frames from a PCAPNG capture (SHB + IDB + EPB/SPB blocks)."""
+    pos = 0
+    total = len(data)
+    endian = "<"
+    interfaces: list[tuple[int, float, float]] = []
+
+    while pos + 12 <= total:
+        raw_type_le = struct.unpack("<I", data[pos : pos + 4])[0]
+        if raw_type_le == PCAPNG_SHB_TYPE:
+            if pos + 16 > total:
+                break
+            bom = struct.unpack("<I", data[pos + 8 : pos + 12])[0]
+            if bom == PCAPNG_BYTE_ORDER_MAGIC_LE:
+                endian = "<"
+            elif bom == PCAPNG_BYTE_ORDER_MAGIC_BE:
+                endian = ">"
+            else:
+                raise ValueError(f"Invalid PCAPNG byte-order magic: 0x{bom:08x}")
+            block_len = struct.unpack(f"{endian}I", data[pos + 4 : pos + 8])[0]
+            if block_len < 28 or pos + block_len > total:
+                break
+            interfaces = []
+            pos += block_len
+            continue
+
+        block_type, block_len = struct.unpack(f"{endian}II", data[pos : pos + 8])
+        if block_len < 12 or pos + block_len > total:
+            break
+        body = data[pos + 8 : pos + block_len - 4]
+        pos += block_len
+
+        if block_type == PCAPNG_IDB_TYPE and len(body) >= 8:
+            link_type, _reserved, _snap_len = struct.unpack(f"{endian}HHI", body[:8])
+            ts_unit, ts_offset = _parse_pcapng_idb_options(body[8:], endian)
+            interfaces.append((link_type, ts_unit, ts_offset))
+        elif block_type == PCAPNG_EPB_TYPE and len(body) >= 20:
+            iface_id, ts_high, ts_low, cap_len, _orig_len = struct.unpack(
+                f"{endian}IIIII", body[:20]
+            )
+            if iface_id >= len(interfaces) or 20 + cap_len > len(body):
+                continue
+            link_type, ts_unit, ts_offset = interfaces[iface_id]
+            ticks = (ts_high << 32) | ts_low
+            ts = ts_offset + ticks * ts_unit
+            yield ts, link_type, body[20 : 20 + cap_len]
+        elif block_type == PCAPNG_SPB_TYPE and len(body) >= 4 and interfaces:
+            orig_len = struct.unpack(f"{endian}I", body[:4])[0]
+            cap_len = min(len(body) - 4, orig_len)
+            link_type, _ts_unit, _ts_offset = interfaces[0]
+            yield 0.0, link_type, body[4 : 4 + cap_len]
 
 
 def _extract_tls_bursts(
@@ -218,7 +397,6 @@ def _extract_tls_bursts(
             idx += 1
             continue
 
-        # Accumulate contiguous client uplink segments for this turn.
         up_start = pkts[idx].ts
         up_end = up_start
         up_bytes = pkts[idx].tls_app_bytes or pkts[idx].payload_len
@@ -228,7 +406,6 @@ def _extract_tls_bursts(
             up_bytes += pkts[idx].tls_app_bytes or pkts[idx].payload_len
             idx += 1
 
-        # Accumulate subsequent server downlink segments until the next client burst.
         if idx >= n or pkts[idx].from_client:
             continue
 
@@ -321,37 +498,20 @@ def read_pcap(
     path: Path | str,
     policy: PolicyConfig | None = None,
 ) -> list[TelemetryEvent]:
-    """Read a standard .pcap file and normalize packets into TLS bursts and ActionEvents."""
+    """Read a .pcap or .pcapng capture and normalize frames into TLS bursts and ActionEvents."""
     cfg = policy or PolicyConfig()
     data = Path(path).read_bytes()
-    if len(data) < 24:
-        raise ValueError(f"File {path} is too small to be a valid .pcap capture.")
+    if len(data) < 12:
+        raise ValueError(f"File {path} is too small to be a valid .pcap/.pcapng capture.")
 
     magic = struct.unpack("<I", data[:4])[0]
-    if magic == PCAP_MAGIC_USEC_LE:
-        endian, ts_div = "<", 1_000_000.0
-    elif magic == PCAP_MAGIC_USEC_BE:
-        endian, ts_div = ">", 1_000_000.0
-    elif magic == PCAP_MAGIC_NSEC_LE:
-        endian, ts_div = "<", 1_000_000_000.0
-    elif magic == PCAP_MAGIC_NSEC_BE:
-        endian, ts_div = ">", 1_000_000_000.0
-    else:
-        raise ValueError(f"Unsupported pcap magic header: 0x{magic:08x}")
+    frame_iter = (
+        _iter_pcapng_frames(data) if magic == PCAPNG_SHB_TYPE else _iter_classic_pcap_frames(data)
+    )
 
-    _vmaj, _vmin, _tz, _sig, _snaplen, link_type = struct.unpack(f"{endian}HHiIII", data[4:24])
-    pos = 24
     flows: dict[tuple[str, int, str, int, int], _FlowState] = {}
 
-    while pos + 16 <= len(data):
-        ts_sec, ts_sub, incl_len, _orig_len = struct.unpack(f"{endian}IIII", data[pos : pos + 16])
-        pos += 16
-        if pos + incl_len > len(data):
-            break
-        frame = data[pos : pos + incl_len]
-        pos += incl_len
-
-        ts = ts_sec + (ts_sub / ts_div)
+    for ts, link_type, frame in frame_iter:
         pkt = _parse_frame(frame, link_type, ts)
         if pkt is None:
             continue
@@ -366,7 +526,6 @@ def read_pcap(
             flow = flows[rev_key]
             from_client = False
         else:
-            # First packet seen defines client -> server direction.
             flow = _FlowState(
                 client_ip=pkt.src_ip,
                 server_ip=pkt.dst_ip,
@@ -384,7 +543,6 @@ def read_pcap(
         if sni:
             flow.sni = sni
             flow.saw_tls = True
-            # ClientHello is handshake metadata, not an application-data turn.
             continue
 
         if pkt.payload[0] == TLS_HANDSHAKE and len(pkt.payload) >= 5 and pkt.payload[1] == 0x03:
@@ -407,15 +565,15 @@ def read_pcap(
 
     events: list[TelemetryEvent] = []
     for flow in flows.values():
-        is_tls_or_llm = (
-            flow.saw_tls
-            or flow.server_port == 443
-            or cfg.is_known_llm_endpoint(flow.sni, flow.server_ip, flow.server_port)
+        total_flow_bytes = sum(p.payload_len for p in flow.packets)
+        is_known_llm = cfg.is_known_llm_endpoint(flow.sni, flow.server_ip, flow.server_port)
+        is_external_tls = (flow.saw_tls or flow.server_port == 443) and not cfg.is_internal_ip(
+            flow.server_ip
         )
-        if is_tls_or_llm and (
-            not cfg.is_internal_ip(flow.server_ip)
-            or cfg.is_known_llm_endpoint(flow.sni, flow.server_ip, flow.server_port)
-        ):
+        # Treat internal plaintext self-hosted LLM ports as LLM bursts only when payload
+        # exceeds tiny single-packet scanner probe sizes (>= 512 bytes).
+        is_internal_llm = is_known_llm and (flow.saw_tls or total_flow_bytes >= 512)
+        if is_external_tls or is_internal_llm:
             events.extend(_extract_tls_bursts(flow, cfg))
         else:
             events.extend(_extract_action_events(flow, cfg))
@@ -427,7 +585,6 @@ def read_pcap(
 def _build_tls_client_hello(sni: str) -> bytes:
     """Construct a minimal RFC-compliant TLS ClientHello carrying the given SNI hostname."""
     sni_bytes = sni.encode("ascii")
-    # SNI extension: type(2)=0x0000, ext_len(2), list_len(2), name_type(1)=0x00, name_len(2), name
     sni_entry = struct.pack("!BH", 0, len(sni_bytes)) + sni_bytes
     sni_list = struct.pack("!H", len(sni_entry)) + sni_entry
     sni_ext = struct.pack("!HH", 0x0000, len(sni_list)) + sni_list
@@ -449,7 +606,7 @@ def _build_tls_app_record(payload_len: int) -> bytes:
     return struct.pack("!BBBH", TLS_APP_DATA, 0x03, 0x03, body_len) + (b"\xa5" * body_len)
 
 
-def _build_eth_ipv4_tcp_frame(
+def _build_eth_ip_tcp_frame(
     src_ip: str,
     dst_ip: str,
     src_port: int,
@@ -459,22 +616,37 @@ def _build_eth_ipv4_tcp_frame(
     payload: bytes,
     flags: int = 0x18,  # PSH + ACK
 ) -> bytes:
-    eth = b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01\x08\x00"
     tcp_hdr = struct.pack(
         "!HHIIBBHHH",
         src_port & 0xFFFF,
         dst_port & 0xFFFF,
         seq & 0xFFFFFFFF,
         ack & 0xFFFFFFFF,
-        0x50,  # data offset = 5 (20 bytes)
+        0x50,
         flags,
         65535,
         0,
         0,
     )
+    src_addr = ipaddress.ip_address(src_ip)
+    dst_addr = ipaddress.ip_address(dst_ip)
+
+    if src_addr.version == 6 or dst_addr.version == 6:
+        eth = b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01\x86\xdd"
+        payload_len = len(tcp_hdr) + len(payload)
+        ipv6_hdr = struct.pack(
+            "!IHBB16s16s",
+            0x60000000,
+            payload_len,
+            6,
+            64,
+            ipaddress.IPv6Address(src_addr).packed,
+            ipaddress.IPv6Address(dst_addr).packed,
+        )
+        return eth + ipv6_hdr + tcp_hdr + payload
+
+    eth = b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01\x08\x00"
     total_len = 20 + len(tcp_hdr) + len(payload)
-    src_b = ipaddress.IPv4Address(src_ip).packed
-    dst_b = ipaddress.IPv4Address(dst_ip).packed
     ip_hdr_no_csum = struct.pack(
         "!BBHHHBBH4s4s",
         0x45,
@@ -485,19 +657,15 @@ def _build_eth_ipv4_tcp_frame(
         64,
         6,
         0,
-        src_b,
-        dst_b,
+        ipaddress.IPv4Address(src_addr).packed,
+        ipaddress.IPv4Address(dst_addr).packed,
     )
     csum = _ipv4_checksum(ip_hdr_no_csum)
     ip_hdr = ip_hdr_no_csum[:10] + struct.pack("!H", csum) + ip_hdr_no_csum[12:]
     return eth + ip_hdr + tcp_hdr + payload
 
 
-def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -> Path:
-    """Serialize TelemetryEvents into a valid Wireshark-openable binary .pcap capture."""
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+def _serialize_events_to_frames(events: Iterable[TelemetryEvent]) -> list[tuple[float, bytes]]:
     raw_packets: list[tuple[float, bytes]] = []
     seq_tracker: dict[tuple[str, int, str, int], int] = defaultdict(lambda: 1000)
     emitted_client_hellos: set[tuple[str, int, str, int]] = set()
@@ -515,7 +683,7 @@ def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -
         rev = (dst_ip, dst_port, src_ip, src_port)
         seq = seq_tracker[fwd]
         ack = seq_tracker[rev]
-        frame = _build_eth_ipv4_tcp_frame(src_ip, dst_ip, src_port, dst_port, seq, ack, payload)
+        frame = _build_eth_ip_tcp_frame(src_ip, dst_ip, src_port, dst_port, seq, ack, payload)
         seq_tracker[fwd] = (seq + len(payload)) & 0xFFFFFFFF
         raw_packets.append((ts, frame))
 
@@ -536,7 +704,6 @@ def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -
                     _build_tls_client_hello(sni),
                 )
 
-            # Chunk uplink bytes across TLS AppData records (<= 1380 B per packet).
             remaining_up = max(1, ev.uplink_bytes)
             up_chunks: list[int] = []
             while remaining_up > 0:
@@ -556,7 +723,6 @@ def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -
                     _build_tls_app_record(chunk),
                 )
 
-            # Emit server downlink SSE/AppData records across decode window.
             rec_count = max(1, ev.downlink_record_count)
             base_rec = max(1, ev.downlink_bytes // rec_count)
             rem = max(0, ev.downlink_bytes - base_rec * rec_count)
@@ -599,9 +765,16 @@ def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -
                 emit_tcp(t_resp, ev.dst_ip, ev.src_ip, dst_port, src_port, b"R" * chunk)
 
     raw_packets.sort(key=lambda item: item[0])
+    return raw_packets
+
+
+def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -> Path:
+    """Serialize TelemetryEvents into a valid Wireshark-openable classic .pcap capture."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_packets = _serialize_events_to_frames(events)
 
     with out_path.open("wb") as fh:
-        # Global PCAP header (little-endian microsecond precision, Ethernet DLT=1)
         fh.write(struct.pack("<IHHiIII", PCAP_MAGIC_USEC_LE, 2, 4, 0, 0, 65535, DLT_EN10MB))
         for ts, frame in raw_packets:
             ts_sec = int(ts)
@@ -611,5 +784,39 @@ def write_pcap_from_events(events: Iterable[TelemetryEvent], path: Path | str) -
                 ts_usec -= 1_000_000
             fh.write(struct.pack("<IIII", ts_sec, ts_usec, len(frame), len(frame)))
             fh.write(frame)
+
+    return out_path
+
+
+def _pack_pcapng_block(block_type: int, body: bytes) -> bytes:
+    padded_len = (len(body) + 3) & ~3
+    padded_body = body + b"\x00" * (padded_len - len(body))
+    total_len = 12 + padded_len
+    return struct.pack("<II", block_type, total_len) + padded_body + struct.pack("<I", total_len)
+
+
+def write_pcapng_from_events(events: Iterable[TelemetryEvent], path: Path | str) -> Path:
+    """Serialize TelemetryEvents into a valid Wireshark-openable .pcapng capture."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_packets = _serialize_events_to_frames(events)
+
+    # Section Header Block (SHB): byte-order magic + v1.0 + unspecified section length (-1).
+    shb_body = struct.pack("<IHHq", PCAPNG_BYTE_ORDER_MAGIC_LE, 1, 0, -1)
+    shb = _pack_pcapng_block(PCAPNG_SHB_TYPE, shb_body)
+
+    # Interface Description Block (IDB): Ethernet DLT=1, snaplen=65535, default 10^-6 resolution.
+    idb_body = struct.pack("<HHI", DLT_EN10MB, 0, 65535)
+    idb = _pack_pcapng_block(PCAPNG_IDB_TYPE, idb_body)
+
+    with out_path.open("wb") as fh:
+        fh.write(shb)
+        fh.write(idb)
+        for ts, frame in raw_packets:
+            ticks = int(round(ts * 1_000_000))
+            ts_high = (ticks >> 32) & 0xFFFFFFFF
+            ts_low = ticks & 0xFFFFFFFF
+            epb_body = struct.pack("<IIIII", 0, ts_high, ts_low, len(frame), len(frame)) + frame
+            fh.write(_pack_pcapng_block(PCAPNG_EPB_TYPE, epb_body))
 
     return out_path

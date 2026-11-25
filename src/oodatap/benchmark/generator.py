@@ -592,3 +592,27 @@ def generate_corpus(
 
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return scenarios
+
+
+def generate_mixed_enterprise_events(
+    seed: int = 500,
+    base_ts: float = 1_760_000_000.0,
+    policy: PolicyConfig | None = None,
+) -> tuple[list[TelemetryEvent], dict[str, VerdictLevel]]:
+    """Merge all 5 host classes concurrently into one noisy enterprise capture."""
+    cfg = policy or PolicyConfig()
+    merged: list[TelemetryEvent] = []
+    expected_by_host: dict[str, VerdictLevel] = {}
+
+    for idx, cls_name in enumerate(SCENARIO_CLASSES):
+        sc = generate_scenario(
+            cls_name,
+            seed=seed + idx * 17,
+            base_ts=base_ts + idx * 3.5,
+            policy=cfg,
+        )
+        merged.extend(sc.events)
+        expected_by_host[sc.primary_host] = sc.expected_verdict
+
+    merged.sort(key=lambda ev: ev.timestamp)
+    return merged, expected_by_host

@@ -64,18 +64,23 @@ def _granger_f_statistic(
 
 
 def _select_primary_llm_stream(bursts: list[TlsBurstEvent]) -> list[TlsBurstEvent]:
-    """Select known LLM bursts if present; otherwise select the busiest HTTPS endpoint."""
-    known = [b for b in bursts if b.is_llm_endpoint]
-    if len(known) >= 3:
-        return sorted(known, key=lambda b: b.timestamp)
-
-    by_endpoint: dict[str, list[TlsBurstEvent]] = {}
+    """Select the busiest coherent LLM endpoint stream (never merging unrelated targets)."""
+    known_by_ep: dict[str, list[TlsBurstEvent]] = {}
+    all_by_ep: dict[str, list[TlsBurstEvent]] = {}
     for b in bursts:
         key = b.sni or f"{b.dst_ip}:{b.dst_port}"
-        by_endpoint.setdefault(key, []).append(b)
-    if not by_endpoint:
+        all_by_ep.setdefault(key, []).append(b)
+        if b.is_llm_endpoint:
+            known_by_ep.setdefault(key, []).append(b)
+
+    if known_by_ep:
+        best_known = max(known_by_ep.values(), key=len)
+        if len(best_known) >= 3:
+            return sorted(best_known, key=lambda b: b.timestamp)
+
+    if not all_by_ep:
         return []
-    busiest = max(by_endpoint.values(), key=len)
+    busiest = max(all_by_ep.values(), key=len)
     return sorted(busiest, key=lambda b: b.timestamp)
 
 

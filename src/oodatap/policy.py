@@ -45,7 +45,7 @@ PORT_PROTOCOL_MAP: dict[int, str] = {
 class DevAllowlistConfig(BaseModel):
     """Destinations and hosts permitted for legitimate developer coding agents."""
 
-    cidrs: list[str] = Field(default_factory=lambda: ["127.0.0.0/8"])
+    cidrs: list[str] = Field(default_factory=lambda: ["127.0.0.0/8", "::1/128"])
     hosts: list[str] = Field(default_factory=list)
     ports: list[int] = Field(default_factory=lambda: [3000, 5173, 8081, 9418])
     approved_dev_hosts: list[str] = Field(default_factory=list)
@@ -76,7 +76,13 @@ class PolicyConfig(BaseModel):
     """Complete OodaTap detection policy."""
 
     internal_cidrs: list[str] = Field(
-        default_factory=lambda: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+        default_factory=lambda: [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "fc00::/7",
+            "fe80::/10",
+        ]
     )
     llm_domains: list[str] = Field(
         default_factory=lambda: [
@@ -92,7 +98,7 @@ class PolicyConfig(BaseModel):
             "openai.azure.com",
         ]
     )
-    llm_ports: list[int] = Field(default_factory=lambda: [11434, 8000, 8080, 4000])
+    llm_ports: list[int] = Field(default_factory=lambda: [11434, 8000, 4000, 1234])
     sensitive_lateral_ports: list[int] = Field(
         default_factory=lambda: [
             22,

@@ -40,10 +40,10 @@ _VERDICT_STYLE: dict[VerdictLevel, str] = {
 @app.command()
 def analyze(
     source: Path = typer.Argument(
-        ..., exists=True, help="Input .pcap, Zeek log, Suricata EVE, or JSONL."
+        ..., exists=True, help="Input .pcap/.pcapng, Zeek log, Suricata EVE, or JSONL."
     ),
     fmt: str = typer.Option(
-        "auto", "--format", "-f", help="Adapter: auto|pcap|zeek|suricata|jsonl."
+        "auto", "--format", "-f", help="Adapter: auto|pcap|pcapng|zeek|suricata|jsonl."
     ),
     policy: Path | None = typer.Option(None, "--policy", "-p", help="Custom YAML policy path."),
     ssl_log: Path | None = typer.Option(None, "--ssl-log", help="Optional Zeek ssl.log path."),
@@ -110,11 +110,11 @@ def analyze(
 @app.command()
 def ingest(
     source: Path = typer.Argument(
-        ..., exists=True, help="Raw .pcap, Zeek log, or Suricata EVE file."
+        ..., exists=True, help="Raw .pcap/.pcapng, Zeek log, or Suricata EVE file."
     ),
     output: Path = typer.Option(..., "--out", "-o", help="Output normalized OodaTap JSONL path."),
     fmt: str = typer.Option(
-        "auto", "--format", "-f", help="Adapter: auto|pcap|zeek|suricata|jsonl."
+        "auto", "--format", "-f", help="Adapter: auto|pcap|pcapng|zeek|suricata|jsonl."
     ),
     policy: Path | None = typer.Option(None, "--policy", "-p", help="Custom YAML policy path."),
     ssl_log: Path | None = typer.Option(None, "--ssl-log", help="Optional Zeek ssl.log path."),

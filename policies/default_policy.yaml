@@ -4,6 +4,8 @@ internal_cidrs:
   - "10.0.0.0/8"
   - "172.16.0.0/12"
   - "192.168.0.0/16"
+  - "fc00::/7"
+  - "fe80::/10"
 
 # Known LLM inference API domains (matched via TLS ClientHello SNI or Zeek/Suricata SSL logs).
 # OodaTap can still score unknown HTTPS endpoints structurally when sawtooth + SSE patterns emerge.
@@ -19,12 +21,12 @@ llm_domains:
   - "bedrock-runtime."
   - "openai.azure.com"
 
-# Self-hosted inference ports (Ollama, vLLM, TGI, LiteLLM)
+# Self-hosted inference ports (Ollama, vLLM, LiteLLM, LM Studio)
 llm_ports:
   - 11434
   - 8000
-  - 8080
   - 4000
+  - 1234
 
 # High-value lateral movement / internal recon ports
 sensitive_lateral_ports:
@@ -50,6 +52,7 @@ sensitive_lateral_ports:
 dev_allowlist:
   cidrs:
     - "127.0.0.0/8"
+    - "::1/128"
   hosts:
     - "10.0.10.50"   # Example internal git / artifact mirror
   ports:
